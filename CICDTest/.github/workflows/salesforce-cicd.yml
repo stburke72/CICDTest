@@ -1,1 +1,425 @@
+name: Salesforce CICD Pipeline
 
+on:
+  # Triggers on push to feature branches
+  push:
+    branches: 
+      - 'feature/**'
+      - 'bugfix/**'
+      - 'dev/**'
+  
+  # Triggers on pull request approval
+  pull_request_review:
+    types: [submitted]
+  
+  # Manual trigger
+  workflow_dispatch:
+    inputs:
+      test_level:
+        description: 'Test Level (RunLocalTests, RunSpecifiedTests, RunAllTestsInOrg)'
+        required: true
+        default: 'RunLocalTests'
+        type: choice
+        options:
+          - RunLocalTests
+          - RunSpecifiedTests
+          - RunAllTestsInOrg
+      specified_tests:
+        description: 'Specified Test Classes (comma-separated, required if test_level is RunSpecifiedTests)'
+        required: false
+        default: ''
+      target_org_alias:
+        description: 'Target Org for Deployment'
+        required: true
+        default: 'dev'
+      target_branch:
+        description: 'Target branch for PR (if creating one)'
+        required: false
+        default: 'main'
+
+env:
+  # Configure pipeline stages (set to true/false to enable/disable)
+  STAGE_CHECK_CONFLICTS: true
+  STAGE_VALIDATE_METADATA: true
+  STAGE_RUN_TESTS: true
+  STAGE_CREATE_PR: true
+  STAGE_DEPLOY: true
+  
+  # Default values if not provided through workflow_dispatch
+  DEFAULT_TEST_LEVEL: RunLocalTests
+  DEFAULT_TARGET_ORG: dev
+  DEFAULT_TARGET_BRANCH: main
+
+jobs:
+  initialize:
+    name: Initialize Pipeline
+    runs-on: ubuntu-latest
+    outputs:
+      test_level: ${{ steps.set-params.outputs.test_level }}
+      specified_tests: ${{ steps.set-params.outputs.specified_tests }}
+      target_org: ${{ steps.set-params.outputs.target_org }}
+      target_branch: ${{ steps.set-params.outputs.target_branch }}
+      event_type: ${{ steps.set-params.outputs.event_type }}
+      pr_number: ${{ steps.set-params.outputs.pr_number }}
+      pr_approved: ${{ steps.check-pr-approval.outputs.approved }}
+    steps:
+      - name: Set Pipeline Parameters
+        id: set-params
+        run: |
+          # Set the event type
+          echo "event_type=${{ github.event_name }}" >> $GITHUB_OUTPUT
+          
+          # Set test level based on input or default
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            echo "test_level=${{ github.event.inputs.test_level }}" >> $GITHUB_OUTPUT
+            echo "specified_tests=${{ github.event.inputs.specified_tests }}" >> $GITHUB_OUTPUT
+            echo "target_org=${{ github.event.inputs.target_org_alias }}" >> $GITHUB_OUTPUT
+            echo "target_branch=${{ github.event.inputs.target_branch }}" >> $GITHUB_OUTPUT
+            echo "pr_number=0" >> $GITHUB_OUTPUT
+          elif [ "${{ github.event_name }}" == "pull_request_review" ]; then
+            echo "test_level=${{ env.DEFAULT_TEST_LEVEL }}" >> $GITHUB_OUTPUT
+            echo "specified_tests=" >> $GITHUB_OUTPUT
+            echo "target_org=${{ env.DEFAULT_TARGET_ORG }}" >> $GITHUB_OUTPUT
+            echo "target_branch=${{ github.base_ref }}" >> $GITHUB_OUTPUT
+            echo "pr_number=${{ github.event.pull_request.number }}" >> $GITHUB_OUTPUT
+          else
+            echo "test_level=${{ env.DEFAULT_TEST_LEVEL }}" >> $GITHUB_OUTPUT
+            echo "specified_tests=" >> $GITHUB_OUTPUT
+            echo "target_org=${{ env.DEFAULT_TARGET_ORG }}" >> $GITHUB_OUTPUT
+            echo "target_branch=${{ env.DEFAULT_TARGET_BRANCH }}" >> $GITHUB_OUTPUT
+            echo "pr_number=0" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Check PR Approval Status
+        id: check-pr-approval
+        if: github.event_name == 'pull_request_review'
+        run: |
+          # Check if the review is an approval
+          if [ "${{ github.event.review.state }}" == "approved" ]; then
+            echo "approved=true" >> $GITHUB_OUTPUT
+            echo "PR #${{ github.event.pull_request.number }} has been approved by ${{ github.event.review.user.login }}"
+          else
+            echo "approved=false" >> $GITHUB_OUTPUT
+            echo "PR #${{ github.event.pull_request.number }} review is not an approval"
+          fi
+
+  check_conflicts:
+    name: Check for Merge Conflicts
+    runs-on: ubuntu-latest
+    needs: initialize
+    if: env.STAGE_CHECK_CONFLICTS == 'true' && (needs.initialize.outputs.event_type == 'push' || needs.initialize.outputs.event_type == 'workflow_dispatch')
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+
+      - name: Check for merge conflicts with target branch
+        run: |
+          TARGET_BRANCH="${{ needs.initialize.outputs.target_branch }}"
+          git fetch origin $TARGET_BRANCH
+          
+          # Check if there are merge conflicts
+          if git merge-tree $(git merge-base HEAD origin/$TARGET_BRANCH) origin/$TARGET_BRANCH HEAD | grep -i "<<<<<"; then
+            echo "::error::Merge conflicts detected with branch $TARGET_BRANCH. Please resolve before proceeding."
+            echo "CONFLICT DETAILS:"
+            git merge-tree $(git merge-base HEAD origin/$TARGET_BRANCH) origin/$TARGET_BRANCH HEAD | grep -A 10 -B 10 "<<<<<<"
+            exit 1
+          else
+            echo "No merge conflicts detected with $TARGET_BRANCH."
+          fi
+
+  validate_metadata:
+    name: Validate Metadata
+    runs-on: ubuntu-latest
+    needs: [initialize, check_conflicts]
+    if: env.STAGE_VALIDATE_METADATA == 'true' && (needs.check_conflicts.result == 'success' || needs.check_conflicts.result == 'skipped')
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+        with:
+          ref: ${{ github.event_name == 'pull_request_review' && github.event.pull_request.head.ref || github.ref }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '18'
+
+      - name: Install Salesforce CLI
+        run: npm install @salesforce/cli --global
+
+      - name: Setup Salesforce auth
+        run: |
+          echo "${{ secrets.SFDX_AUTH_URL }}" > ./authfile
+          sf org login sfdx-url -f ./authfile -a DevOrg
+          rm -f ./authfile
+
+      - name: Check Salesforce Package Validation
+        run: |
+          TARGET_ORG="${{ needs.initialize.outputs.target_org }}"
+          echo "Validating deployment to $TARGET_ORG org..."
+          
+          sf project deploy validate --source-dir force-app/main/default \
+            --target-org $TARGET_ORG \
+            --checkonly \
+            --test-level ${{ needs.initialize.outputs.test_level }} \
+            ${{ needs.initialize.outputs.test_level == 'RunSpecifiedTests' && format('--tests {0}', needs.initialize.outputs.specified_tests) || '' }} \
+            --json > deployment_validation.json
+          
+          cat deployment_validation.json
+          
+          # Check if validation was successful
+          if grep -q "\"status\": 0" deployment_validation.json; then
+            echo "Metadata validation successful!"
+          else
+            echo "::error::Metadata validation failed!"
+            exit 1
+          fi
+
+  run_tests:
+    name: Run Apex Tests
+    runs-on: ubuntu-latest
+    needs: [initialize, validate_metadata]
+    if: env.STAGE_RUN_TESTS == 'true' && (needs.validate_metadata.result == 'success' || needs.validate_metadata.result == 'skipped')
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+        with:
+          ref: ${{ github.event_name == 'pull_request_review' && github.event.pull_request.head.ref || github.ref }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '18'
+
+      - name: Install Salesforce CLI
+        run: npm install @salesforce/cli --global
+
+      - name: Setup Salesforce auth
+        run: |
+          echo "${{ secrets.SFDX_AUTH_URL }}" > ./authfile
+          sf org login sfdx-url -f ./authfile -a DevOrg
+          rm -f ./authfile
+
+      - name: Run Apex Tests
+        id: run-tests
+        run: |
+          TARGET_ORG="${{ needs.initialize.outputs.target_org }}"
+          TEST_LEVEL="${{ needs.initialize.outputs.test_level }}"
+          SPECIFIED_TESTS="${{ needs.initialize.outputs.specified_tests }}"
+          
+          echo "Running $TEST_LEVEL in $TARGET_ORG org..."
+          
+          if [ "$TEST_LEVEL" == "RunSpecifiedTests" ]; then
+            if [ -z "$SPECIFIED_TESTS" ]; then
+              echo "::error::No tests specified for RunSpecifiedTests level"
+              exit 1
+            fi
+            TEST_CMD="sf apex run test --target-org $TARGET_ORG --tests $SPECIFIED_TESTS --result-format json --wait 10"
+          elif [ "$TEST_LEVEL" == "RunLocalTests" ]; then
+            TEST_CMD="sf apex run test --target-org $TARGET_ORG --test-level RunLocalTests --result-format json --wait 10"
+          else
+            TEST_CMD="sf apex run test --target-org $TARGET_ORG --test-level RunAllTestsInOrg --result-format json --wait 10"
+          fi
+          
+          echo "Running command: $TEST_CMD"
+          eval "$TEST_CMD > test_results.json"
+          
+          # Check test results
+          OUTCOME=$(cat test_results.json | jq -r '.result.summary.outcome')
+          echo "Test outcome: $OUTCOME"
+          echo "test_outcome=$OUTCOME" >> $GITHUB_OUTPUT
+          
+          # Output test results summary
+          echo "Tests ran: $(cat test_results.json | jq -r '.result.summary.testsRan')"
+          echo "Passed: $(cat test_results.json | jq -r '.result.summary.passing')"
+          echo "Failed: $(cat test_results.json | jq -r '.result.summary.failing')"
+          echo "Pass rate: $(cat test_results.json | jq -r '.result.summary.passRate')%"
+          echo "Failures: $(cat test_results.json | jq -r '.result.tests | map(select(.outcome == "Fail")) | .[].fullName' 2>/dev/null || echo 'None')"
+          
+          if [ "$OUTCOME" != "Passed" ]; then
+            echo "::error::Tests failed! See details above."
+            exit 1
+          fi
+          
+          echo "All tests passed successfully!"
+
+      - name: Upload Test Results
+        uses: actions/upload-artifact@v3
+        with:
+          name: test-results
+          path: test_results.json
+
+  create_pull_request:
+    name: Create Pull Request
+    runs-on: ubuntu-latest
+    needs: [initialize, run_tests]
+    if: env.STAGE_CREATE_PR == 'true' && needs.initialize.outputs.event_type == 'push' && needs.run_tests.result == 'success'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Create Pull Request
+        id: create-pr
+        uses: peter-evans/create-pull-request@v5
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          commit-message: "Automated PR: Successful validation for ${{ needs.initialize.outputs.target_org }} org"
+          title: "[Pending Review] ${{ github.ref_name }} to ${{ needs.initialize.outputs.target_branch }}"
+          body: |
+            ## Automated Pull Request
+            
+            This PR was automatically created after successful validation and tests.
+            
+            ### Details:
+            - Source Branch: `${{ github.ref_name }}`
+            - Target Branch: `${{ needs.initialize.outputs.target_branch }}`
+            - Test Level: `${{ needs.initialize.outputs.test_level }}`
+            - Commit: ${{ github.sha }}
+            
+            **IMPORTANT:** This PR must be reviewed and approved before changes will be deployed to the ${{ needs.initialize.outputs.target_org }} org.
+          base: ${{ needs.initialize.outputs.target_branch }}
+          branch: ${{ github.ref_name }}
+          labels: |
+            automated
+            salesforce
+            pending-review
+
+      - name: Output PR Number
+        if: steps.create-pr.outputs.pull-request-number
+        run: |
+          echo "Created PR #${{ steps.create-pr.outputs.pull-request-number }}"
+          echo "PR URL: ${{ steps.create-pr.outputs.pull-request-url }}"
+
+  deploy:
+    name: Deploy to Org
+    runs-on: ubuntu-latest
+    needs: [initialize, run_tests]
+    if: env.STAGE_DEPLOY == 'true' && needs.initialize.outputs.event_type == 'pull_request_review' && needs.initialize.outputs.pr_approved == 'true' && (needs.run_tests.result == 'success' || needs.run_tests.result == 'skipped')
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+        with:
+          ref: ${{ github.event.pull_request.head.ref }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '18'
+
+      - name: Install Salesforce CLI
+        run: npm install @salesforce/cli --global
+
+      - name: Setup Salesforce auth
+        run: |
+          echo "${{ secrets.SFDX_AUTH_URL }}" > ./authfile
+          sf org login sfdx-url -f ./authfile -a DevOrg
+          rm -f ./authfile
+
+      - name: Deploy to Target Org
+        run: |
+          TARGET_ORG="${{ needs.initialize.outputs.target_org }}"
+          TEST_LEVEL="${{ needs.initialize.outputs.test_level }}"
+          SPECIFIED_TESTS="${{ needs.initialize.outputs.specified_tests }}"
+          
+          echo "Deploying to $TARGET_ORG org after PR approval..."
+          
+          DEPLOY_CMD="sf project deploy start --source-dir force-app/main/default \
+            --target-org $TARGET_ORG \
+            --test-level $TEST_LEVEL"
+            
+          if [ "$TEST_LEVEL" == "RunSpecifiedTests" ] && [ ! -z "$SPECIFIED_TESTS" ]; then
+            DEPLOY_CMD="$DEPLOY_CMD --tests $SPECIFIED_TESTS"
+          fi
+          
+          echo "Running command: $DEPLOY_CMD"
+          eval "$DEPLOY_CMD"
+          
+          if [ $? -ne 0 ]; then
+            echo "::error::Deployment failed!"
+            exit 1
+          fi
+          
+          echo "Deployment successful!"
+
+      - name: Update PR with Deployment Status
+        uses: peter-evans/create-or-update-comment@v3
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          issue-number: ${{ needs.initialize.outputs.pr_number }}
+          body: |
+            ## ✅ Deployment Successful
+            
+            The changes have been successfully deployed to the ${{ needs.initialize.outputs.target_org }} org.
+            
+            **Deployment Details:**
+            - Target Org: ${{ needs.initialize.outputs.target_org }}
+            - Test Level: ${{ needs.initialize.outputs.test_level }}
+            - Deployed at: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+  notify:
+    name: Send Notification
+    runs-on: ubuntu-latest
+    needs: [initialize, check_conflicts, validate_metadata, run_tests, create_pull_request, deploy]
+    if: always()
+    steps:
+      - name: Determine workflow status
+        id: status
+        run: |
+          EVENT_TYPE="${{ needs.initialize.outputs.event_type }}"
+          
+          if [[ "${{ needs.check_conflicts.result }}" == "failure" ]]; then
+            echo "status=Merge conflicts detected" >> $GITHUB_OUTPUT
+            echo "result=failure" >> $GITHUB_OUTPUT
+          elif [[ "${{ needs.validate_metadata.result }}" == "failure" ]]; then
+            echo "status=Metadata validation failed" >> $GITHUB_OUTPUT
+            echo "result=failure" >> $GITHUB_OUTPUT
+          elif [[ "${{ needs.run_tests.result }}" == "failure" ]]; then
+            echo "status=Tests failed" >> $GITHUB_OUTPUT
+            echo "result=failure" >> $GITHUB_OUTPUT
+          elif [[ "${{ needs.create_pull_request.result }}" == "failure" && "${{ env.STAGE_CREATE_PR }}" == "true" && "$EVENT_TYPE" == "push" ]]; then
+            echo "status=Pull request creation failed" >> $GITHUB_OUTPUT
+            echo "result=failure" >> $GITHUB_OUTPUT
+          elif [[ "${{ needs.deploy.result }}" == "failure" && "${{ env.STAGE_DEPLOY }}" == "true" && "$EVENT_TYPE" == "pull_request_review" ]]; then
+            echo "status=Deployment failed" >> $GITHUB_OUTPUT
+            echo "result=failure" >> $GITHUB_OUTPUT
+          elif [[ "$EVENT_TYPE" == "push" && "${{ needs.create_pull_request.result }}" == "success" ]]; then
+            echo "status=PR created successfully, waiting for approval" >> $GITHUB_OUTPUT
+            echo "result=success" >> $GITHUB_OUTPUT
+          elif [[ "$EVENT_TYPE" == "pull_request_review" && "${{ needs.deploy.result }}" == "success" ]]; then
+            echo "status=Changes deployed successfully after PR approval" >> $GITHUB_OUTPUT
+            echo "result=success" >> $GITHUB_OUTPUT
+          else
+            echo "status=Pipeline completed successfully" >> $GITHUB_OUTPUT
+            echo "result=success" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Send Slack notification (optional)
+        if: false  # Set to true and configure with your webhook to enable Slack notifications
+        uses: 8398a7/action-slack@v3
+        with:
+          status: ${{ steps.status.outputs.result }}
+          text: |
+            *CICD Pipeline Result:* ${{ steps.status.outputs.status }}
+            *Branch:* ${{ github.ref_name }}
+            *Org:* ${{ needs.initialize.outputs.target_org }}
+            *See details:* ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+      - name: Send Email notification (optional)
+        if: false  # Set to true and configure with your SMTP settings to enable email notifications
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: ${{ secrets.MAIL_SERVER }}
+          server_port: ${{ secrets.MAIL_PORT }}
+          username: ${{ secrets.MAIL_USERNAME }}
+          password: ${{ secrets.MAIL_PASSWORD }}
+          subject: "CICD Pipeline Result: ${{ steps.status.outputs.status }}"
+          body: |
+            CICD Pipeline Result: ${{ steps.status.outputs.status }}
+            Branch: ${{ github.ref_name }}
+            Org: ${{ needs.initialize.outputs.target_org }}
+            See details: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          to: ${{ secrets.NOTIFICATION_EMAIL }}
+          from: CICD Pipeline <${{ secrets.MAIL_FROM }}>
